@@ -1,4 +1,4 @@
 # Common requirements for examples.
 -r ../../common_requirements.txt
-langchainhub
+langgraph
 networkx
