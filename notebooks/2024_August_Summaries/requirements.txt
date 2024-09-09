@@ -1,0 +1,4 @@
+# Common requirements for examples.
+-r ../../common_requirements.txt
+langgraph
+networkx
