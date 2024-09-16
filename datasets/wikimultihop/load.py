@@ -1,4 +1,4 @@
-from typing import Iterable, Optional, Tuple
+from typing import Iterable, Iterator
 import json
 import zipfile
 import dotenv
@@ -8,8 +8,10 @@ from langchain_core.graph_vectorstores.links import METADATA_LINKS_KEY, Link
 from tqdm import tqdm
 import concurrent.futures
 from os.path import dirname, join as joinpath
+from math import ceil
 
 from utils.batched import batched
+from utils.persistent_iteration import Offset, PersistentIteration
 
 dotenv.load_dotenv()
 
@@ -17,67 +19,67 @@ LINES_IN_FILE=5989847
 
 PARA_WITH_HYPERLINK = joinpath(dirname(__file__), 'para_with_hyperlink.zip')
 
-def documents(skip: int = 0) -> Iterable[Tuple[int, Document]]:
+def wikipedia_lines() -> Iterable[str]:
     with zipfile.ZipFile(PARA_WITH_HYPERLINK, 'r') as archive:
         with archive.open('para_with_hyperlink.jsonl', 'r') as para_with_hyperlink:
-            lines = iter(enumerate(tqdm(para_with_hyperlink, total=LINES_IN_FILE)))
-            if skip > 0:
-                [next(lines, None) for _ in range(skip)]
-            try:
-                while True:
-                    index, line = next(lines)
-                    para = json.loads(line)
+            for line in para_with_hyperlink:
+                yield line
 
-                    id = para["id"]
-                    links = {
-                        Link.outgoing(kind="href", tag=id)
-                        for m in para["mentions"]
-                        if m["ref_ids"] is not None
-                        for id in m["ref_ids"]
-                    }
-                    links.add(Link.incoming(kind="href", tag=id))
-                    yield index, Document(
-                        id = id,
-                        page_content = " ".join(para["sentences"]),
-                        metadata = {
-                            "content_id": para["id"],
-                            METADATA_LINKS_KEY: list(links)
-                        },
-                    )
-            except StopIteration:
-                pass
+def parse_document(line: str) -> Document:
+    para = json.loads(line)
 
-# cassio.init(auto=True)
+    id = para["id"]
+    links = {
+        Link.outgoing(kind="href", tag=id)
+        for m in para["mentions"]
+        if m["ref_ids"] is not None
+        for id in m["ref_ids"]
+    }
+    links.add(Link.incoming(kind="href", tag=id))
+    return Document(
+        id = id,
+        page_content = " ".join(para["sentences"]),
+        metadata = {
+            "content_id": para["id"],
+            METADATA_LINKS_KEY: list(links)
+        },
+    )
 
-# from cassio.config import check_resolve_session
-# check_resolve_session().default_timeout = 30.0
-
-def load_batch(batch, knowledge_store: GraphVectorStore):
-    if batch:
-        docs = [doc for _, doc in batch]
-        min_index, _ = batch[0]
-        max_index, _ = batch[len(batch) - 1]
+def load_batch(offset: Offset,
+               lines: Iterator[str],
+               knowledge_store: GraphVectorStore,
+               persistence: PersistentIteration[Iterator[str]]):
+    docs = [parse_document(line) for line in lines]
+    if docs:
         knowledge_store.add_documents(docs)
-    return (min_index, max_index)
+    persistence.ack(offset)
 
 BATCH_SIZE=1000
 MAX_IN_FLIGHT=5
 
 def load_2wikimultihop(knowledge_store: GraphVectorStore):
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_IN_FLIGHT) as executor:
         futures = set()
-        for batch in batched(documents(), BATCH_SIZE):
-            futures.add(executor.submit(load_batch, batch, knowledge_store))
+        persistence = PersistentIteration(
+            journal_name="load_2wikimultihop.jrnl",
+            iterator = batched(wikipedia_lines(), BATCH_SIZE)
+        )
+        total_batches = ceil(LINES_IN_FILE / BATCH_SIZE) - persistence.completed_count()
+        if persistence.completed_count() > 0:
+            print(f"Resuming loading with {persistence.completed_count()} completed, {total_batches} remaining")
+        for offset, batch in tqdm(persistence, total=total_batches):
+            futures.add(executor.submit(load_batch, offset, batch, knowledge_store, persistence))
 
             if len(futures) >= MAX_IN_FLIGHT:
                 done, pending = concurrent.futures.wait(futures, return_when="FIRST_COMPLETED")
                 for future in done:
-                    (min_index, max_index) = future.result()
-                    print(f"Completed batch ({min_index}, {max_index})")
+                    _ = future.result()
                 futures = pending
+
         while futures:
-            done, pending = concurrent.futures.wait(futures, return_when="FIRST_COMPLETED")
+            done, pending = concurrent.futures.wait(futures, return_when="ALL_COMPLETED")
             for future in done:
-                (min_index, max_index) = future.result()
-                print(f"Completed batch ({min_index}, {max_index})")
+                _ = future.result()
             futures = pending
+
+        assert persistence.pending_count() == 0
