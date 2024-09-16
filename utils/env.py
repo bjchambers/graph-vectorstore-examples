@@ -38,7 +38,7 @@ def initialize_from_prompts():
     os.environ['ASTRA_DB_APPLICATION_TOKEN'] = getpass('ASTRA_DB_APPLICATION_TOKEN')
 
     if (keyspace := input('ASTRA_DB_KEYSPACE (empty for default)')) is not None:
-        os.environ['ASTRA_DB_KEYSPACE']
+        os.environ['ASTRA_DB_KEYSPACE'] = keyspace
     else:
         os.environ.pop('ASTRA_DB_KEYSPACE', None)
 
