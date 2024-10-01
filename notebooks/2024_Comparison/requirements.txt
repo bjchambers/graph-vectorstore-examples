@@ -1,3 +1,5 @@
 # Common requirements for examples.
 -r ../../common_requirements.txt
-langgraph
+langchain_experimental
+langchainhub
+neo4j
