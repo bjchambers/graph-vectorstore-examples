@@ -1,24 +1,40 @@
+from enum import StrEnum, auto
 from dotenv import find_dotenv, load_dotenv
 import os
 
-def verify_environment():
+class Environment(StrEnum):
+    CASSIO = auto()
+    ASTRAPY = auto()
+
+    def required_envvars(self) -> list[str]:
+        required = ['OPENAI_API_KEY', 'ASTRA_DB_APPLICATION_TOKEN']
+        if self == Environment.CASSIO:
+            required.append('ASTRA_DB_DATABASE_ID')
+        elif self == Environment.ASTRAPY:
+            required.append('ASTRA_DB_API_ENDPOINT')
+        else:
+            raise ValueError(f"Unrecognized environment '{self}")
+        return required
+
+NON_SECRETS = {'ASTRA_DB_API_ENDPOINT', 'ASTRA_DB_DATABASE_ID'}
+"""Environment variables that don't can use `input` instead of `getpass`."""
+
+def verify_environment(env: Environment = Environment.CASSIO):
     """Verify the necessary environment variables are set.
     """
-    assert 'OPENAI_API_KEY' in os.environ
-    assert 'ASTRA_DB_DATABASE_ID' in os.environ
-    assert 'ASTRA_DB_APPLICATION_TOKEN' in os.environ
+    for required in env.required_envvars():
+        assert required in os.environ, f'"{required}" not defined in environment'
 
-def initialize_from_colab_userdata():
+def initialize_from_colab_userdata(env: Environment = Environment.CASSIO):
     """Try to initialize environment from colab `userdata`.
     """
     from google.colab import userdata
-    os.environ['OPENAI_API_KEY'] = userdata.get('OPENAI_API_KEY')
-    os.environ['ASTRA_DB_DATABASE_ID'] = userdata.get('ASTRA_DB_DATABASE_ID')
-    os.environ['ASTRA_DB_APPLICATION_TOKEN'] = userdata.get('ASTRA_DB_APPLICATION_TOKEN')
+    for required in env.required_envvars():
+        os.environ[required] = userdata.get(required)
 
     try:
         os.environ['ASTRA_DB_KEYSPACE'] = userdata.get('ASTRA_DB_KEYSPACE')
-    except userdata.SecretNotFoundError as e:
+    except userdata.SecretNotFoundError as _:
         # User doesn't have a keyspace set, so use the default.
         os.environ.pop('ASTRA_DB_KEYSPACE', None)
 
@@ -30,12 +46,14 @@ def initialize_from_colab_userdata():
         os.environ.pop('LANGCHAIN_API_KEY')
         os.environ.pop('LANGCHAIN_TRACING_V2')
 
-def initialize_from_prompts():
+def initialize_from_prompts(env: Environment = Environment.CASSIO):
     import getpass
 
-    os.environ['OPENAI_API_KEY'] = getpass('OPENAI_API_KEY')
-    os.environ['ASTRA_DB_DATABASE_ID'] = input('ASTRA_DB_DATABASE_ID')
-    os.environ['ASTRA_DB_APPLICATION_TOKEN'] = getpass('ASTRA_DB_APPLICATION_TOKEN')
+    for required in env.required_envvars():
+        if NON_SECRETS.contains(required):
+            os.environ[required] = input(required)
+        else:
+            os.environ[required] = getpass(required)
 
     if (keyspace := input('ASTRA_DB_KEYSPACE (empty for default)')) is not None:
         os.environ['ASTRA_DB_KEYSPACE'] = keyspace
@@ -49,7 +67,7 @@ def initialize_from_prompts():
         os.environ.pop('LANGCHAIN_API_KEY')
         os.environ.pop('LANGCHAIN_TRACING_V2')
 
-def initialize_environment():
+def initialize_environment(env: Environment = Environment.CASSIO):
     """Initialize the environment variables.
 
     This uses the following:
@@ -61,17 +79,17 @@ def initialize_environment():
     # 1. If a `.env` file is found, load environment variables from that.
     if (dotenv_path := find_dotenv()) is not None:
         load_dotenv(dotenv_path)
-        verify_environment()
+        verify_environment(env)
         return
 
     # 2. If not, and running in colab, set necesary environment variables from secrets.
     try:
-        initialize_from_colab_userdata()
-        verify_environment()
+        initialize_from_colab_userdata(env)
+        verify_environment(env)
         return
     except (ImportError, ModuleNotFoundError):
         pass
 
     # 3. Initialize from prompts.
-    initialize_from_prompts()
-    verify_environment()
+    initialize_from_prompts(env)
+    verify_environment(env)

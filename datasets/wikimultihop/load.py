@@ -1,10 +1,16 @@
-from typing import Iterable, Iterator
+import asyncio
+
+import astrapy
+import astrapy.exceptions
+import httpx
+import backoff
+from typing import Iterable, Iterator, TypeVar, Callable
 import json
 import zipfile
 import dotenv
 from langchain_core.documents import Document
-from langchain_core.graph_vectorstores import GraphVectorStore
-from langchain_core.graph_vectorstores.links import METADATA_LINKS_KEY, Link
+from langchain_core.vectorstores import VectorStore
+from langchain_community.graph_vectorstores.base import Link, METADATA_LINKS_KEY
 from tqdm import tqdm
 import concurrent.futures
 from os.path import dirname, join as joinpath
@@ -45,19 +51,57 @@ def parse_document(line: str) -> Document:
         },
     )
 
-def load_batch(offset: Offset,
-               lines: Iterator[str],
-               knowledge_store: GraphVectorStore,
-               persistence: PersistentIteration[Iterator[str]]):
-    docs = [parse_document(line) for line in lines]
-    if docs:
-        knowledge_store.add_documents(docs)
-    persistence.ack(offset)
-
 BATCH_SIZE=1000
 MAX_IN_FLIGHT=5
 
-def load_2wikimultihop(knowledge_store: GraphVectorStore):
+EXCEPTIONS_TO_RETRY = (
+    httpx.NetworkError,
+    astrapy.exceptions.DataAPIException,
+)
+
+MAX_RETRIES = 8
+
+StoreT = TypeVar("StoreT")
+
+def prepare_batch(lines: Iterable[str]) -> Iterable[Document]:
+    return [parse_document(line) for line in lines]
+
+BatchPreparer = Callable[[Iterator[str]], Iterator[Document]]
+
+async def aload_2wikimultihop(store: VectorStore,
+                              batch_prepare: BatchPreparer = prepare_batch) -> None:
+    persistence = PersistentIteration(
+        journal_name="load_2wikimultihop.jrnl",
+        iterator = batched(wikipedia_lines(), BATCH_SIZE)
+    )
+    total_batches = ceil(LINES_IN_FILE / BATCH_SIZE) - persistence.completed_count()
+    if persistence.completed_count() > 0:
+        print(f"Resuming loading with {persistence.completed_count()} completed, {total_batches} remaining")
+    async with asyncio.TaskGroup() as tg:
+        tasks = []
+
+        @backoff.on_exception(
+            backoff.expo,
+            EXCEPTIONS_TO_RETRY,
+            max_tries = MAX_RETRIES,
+        )
+        async def add_docs(batch_docs, offset) -> None:
+            await store.aadd_documents(batch_docs)
+            persistence.ack(offset)
+        for offset, batch_lines in tqdm(persistence, total=total_batches):
+            batch_docs = batch_prepare(batch_lines)
+            if batch_docs:
+                tasks.append(tg.create_task(add_docs(batch_docs, offset)))
+                while len(tasks) >= MAX_IN_FLIGHT:
+                    _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                    tasks = list(pending)
+            else:
+                persistence.ack(offset)
+
+    assert persistence.pending_count() == 0
+
+def load_2wikimultihop(store: VectorStore,
+                       batch_preparer: BatchPreparer = prepare_batch) -> None:
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_IN_FLIGHT) as executor:
         futures = set()
         persistence = PersistentIteration(
@@ -67,19 +111,33 @@ def load_2wikimultihop(knowledge_store: GraphVectorStore):
         total_batches = ceil(LINES_IN_FILE / BATCH_SIZE) - persistence.completed_count()
         if persistence.completed_count() > 0:
             print(f"Resuming loading with {persistence.completed_count()} completed, {total_batches} remaining")
-        for offset, batch in tqdm(persistence, total=total_batches):
-            futures.add(executor.submit(load_batch, offset, batch, knowledge_store, persistence))
 
-            if len(futures) >= MAX_IN_FLIGHT:
-                done, pending = concurrent.futures.wait(futures, return_when="FIRST_COMPLETED")
-                for future in done:
-                    _ = future.result()
-                futures = pending
+        @backoff.on_exception(
+            backoff.expo,
+            EXCEPTIONS_TO_RETRY,
+            max_tries = MAX_RETRIES,
+        )
+        def add_docs(batch_docs, offset):
+            store.add_documents(batch_docs)
+            persistence.ack(offset)
+
+        for offset, batch_lines in tqdm(persistence, total=total_batches):
+            batch_docs = batch_preparer(batch_lines)
+            if batch_docs:
+                futures.add(executor.submit(add_docs(batch_docs, offset)))
+                while len(futures) >= MAX_IN_FLIGHT:
+                    done, pending = concurrent.futures.wait(futures, return_when="FIRST_COMPLETED")
+                    for future in done:
+                        _ = future.result()
+                    futures = pending
+            else:
+                persistence.ack(offset)
 
         while futures:
             done, pending = concurrent.futures.wait(futures, return_when="ALL_COMPLETED")
             for future in done:
                 _ = future.result()
+
             futures = pending
 
         assert persistence.pending_count() == 0
