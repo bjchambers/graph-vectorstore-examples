@@ -75,7 +75,6 @@ def initialize_environment(env: Environment = Environment.CASSIO):
     2. If not, and running in colab, set necessary environment variables from secrets.
     3. If necessary variables aren't set by the above, then prompts the user.
     """
-
     # 1. If a `.env` file is found, load environment variables from that.
     if (dotenv_path := find_dotenv()) is not None:
         load_dotenv(dotenv_path)
